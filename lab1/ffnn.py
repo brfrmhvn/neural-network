@@ -2,18 +2,38 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
+
+
+# Dataset для правильной обработки меток
+class FilteredEMNIST(Dataset):
+    def __init__(self, dataset, classes_to_keep):
+        self.data = []
+        self.targets = []
+        for img, label in dataset:
+            if label in classes_to_keep:
+                self.data.append(img)
+                self.targets.append(label - 1)  # конвертируем 1-13 в 0-12
+
+        self.targets = torch.tensor(self.targets)
+
+    def __getitem__(self, index):
+        return self.data[index], self.targets[index]
+
+    def __len__(self):
+        return len(self.targets)
 
 
 # модель FFNN
 class SimpleFFNN(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes, activation_fn):
-        super(SimpleFFNN, self).__init__()
+        super().__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.fc3 = nn.Linear(hidden_size, num_classes)
         self.activation_fn = activation_fn
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x):
         x = self.activation_fn(self.fc1(x))
@@ -22,13 +42,13 @@ class SimpleFFNN(nn.Module):
         return x
 
 
-# Функция для вычисления точности
 def compute_accuracy(model, data_loader):
     correct = 0
     total = 0
+    model.eval()
     with torch.no_grad():
         for images, labels in data_loader:
-            outputs = model(images)
+            outputs = model(images.view(-1, 28 * 28))
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
@@ -38,7 +58,7 @@ def compute_accuracy(model, data_loader):
 def train_model(train_loader, test_loader, input_size, hidden_size, num_classes, activation_fn, num_epochs=10):
     model = SimpleFFNN(input_size, hidden_size, num_classes, activation_fn)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
 
     train_losses = []
     train_accuracies = []
@@ -48,6 +68,7 @@ def train_model(train_loader, test_loader, input_size, hidden_size, num_classes,
         model.train()
         running_loss = 0.0
         for images, labels in train_loader:
+            images = images.view(-1, input_size)
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, labels)
@@ -55,101 +76,92 @@ def train_model(train_loader, test_loader, input_size, hidden_size, num_classes,
             optimizer.step()
             running_loss += loss.item()
 
-        # потери и точность на обучающих данных
         train_loss = running_loss / len(train_loader)
+        train_acc = compute_accuracy(model, train_loader)
+        test_acc = compute_accuracy(model, test_loader)
+
         train_losses.append(train_loss)
-        train_accuracy = compute_accuracy(model, train_loader)
-        train_accuracies.append(train_accuracy)
+        train_accuracies.append(train_acc)
+        test_accuracies.append(test_acc)
 
-        # точность на тестовых данных
-        test_accuracy = compute_accuracy(model, test_loader)
-        test_accuracies.append(test_accuracy)
-
-        print(f"Epoch [{epoch+1}/{num_epochs}], "
-              f"Train Loss: {train_loss:.4f}, "
-              f"Train Accuracy: {train_accuracy:.2f}%, "
-              f"Test Accuracy: {test_accuracy:.2f}%")
+        print(f"Epoch [{epoch + 1}/{num_epochs}], "
+              f"Loss: {train_loss:.4f}, "
+              f"Train Acc: {train_acc:.1f}%, "
+              f"Test Acc: {test_acc:.1f}%")
 
     return train_losses, train_accuracies, test_accuracies
 
 
 def main():
     transform = transforms.Compose([
-        transforms.Grayscale(),
-        transforms.Resize((32, 32)),
+        transforms.RandomRotation(20),  # поворот ±20°
+        transforms.RandomAffine(0, translate=(0.1, 0.1)),  # случайный сдвиг
         transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
-        transforms.Lambda(lambda x: x.view(-1))  # изображение в вектор
+        transforms.Normalize((0.5,), (0.5,))
     ])
 
-    train_dataset = datasets.ImageFolder(root='learning_dataset', transform=transform)
-    test_dataset = datasets.ImageFolder(root='testing_dataset', transform=transform)
+    # загрузка данных и фильтрация классов A-M (1-13)
+    classes_to_keep = list(range(1, 14))  # буквы A-M
+
+    train_data = datasets.EMNIST(root='./data', split='letters', train=True, download=True, transform=transform)
+    test_data = datasets.EMNIST(root='./data', split='letters', train=False, download=True, transform=transform)
+
+    train_dataset = FilteredEMNIST(train_data, classes_to_keep)
+    test_dataset = FilteredEMNIST(test_data, classes_to_keep)
 
     # параметры
-    input_size = 32 * 32
-    num_classes = len(train_dataset.classes)
-    num_epochs = 10
+    input_size = 28 * 28
+    hidden_size = 128
+    num_classes = 13  # A-M
+    num_epochs = 15
 
     # функции активации
     activation_fns = {
         'ReLU': torch.relu,
         'Sigmoid': torch.sigmoid,
         'Tanh': torch.tanh,
-        'Leaky ReLU': torch.nn.functional.leaky_relu,
-        'ELU': torch.nn.functional.elu
+        'LeakyReLU': nn.LeakyReLU(0.1),
+        'ELU': nn.ELU()
     }
 
-    # размеры скрытого слоя
-    hidden_sizes = [64, 128, 256]
+    # DataLoaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    results = {hidden_size: {name: {'train_loss': [], 'train_accuracy': [], 'test_accuracy': []} for name in activation_fns} for hidden_size in hidden_sizes}
+    # обучение
+    results = {}
+    for name, activation_fn in activation_fns.items():
+        print(f"\n=== {name} ===")
+        train_loss, train_acc, test_acc = train_model(
+            train_loader, test_loader,
+            input_size, hidden_size,
+            num_classes, activation_fn, num_epochs
+        )
+        results[name] = {
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'test_acc': test_acc
+        }
 
-    # обучение и тестирование
-    for hidden_size in hidden_sizes:
-        for name, activation_fn in activation_fns.items():
-            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-            test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    # визуализация
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 2, 1)
+    for name, data in results.items():
+        plt.plot(data['train_loss'], label=name)
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.legend()
 
-            print(f"Training with {name} and hidden size {hidden_size}...")
-            train_losses, train_accuracies, test_accuracies = train_model(train_loader, test_loader, input_size, hidden_size, num_classes, activation_fn, num_epochs)
+    plt.subplot(1, 2, 2)
+    for name, data in results.items():
+        plt.plot(data['test_acc'], label=name)
+    plt.title('Test Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
 
-            results[hidden_size][name]['train_loss'] = train_losses
-            results[hidden_size][name]['train_accuracy'] = train_accuracies
-            results[hidden_size][name]['test_accuracy'] = test_accuracies
-
-    # графики для каждого hidden_size
-    for hidden_size in hidden_sizes:
-        plt.figure(figsize=(18, 6))
-
-        # графики потерь
-        plt.subplot(1, 3, 1)
-        for name, data in results[hidden_size].items():
-            plt.plot(data['train_loss'], label=f"{name}")
-        plt.xlabel('Epoch')
-        plt.ylabel('Training Loss')
-        plt.title(f'Training Loss (Hidden Size: {hidden_size})')
-        plt.legend()
-
-        # точность на обучающих данных
-        plt.subplot(1, 3, 2)
-        for name, data in results[hidden_size].items():
-            plt.plot(data['train_accuracy'], label=f"{name}")
-        plt.xlabel('Epoch')
-        plt.ylabel('Training Accuracy')
-        plt.title(f'Training Accuracy (Hidden Size: {hidden_size})')
-        plt.legend()
-
-        # точность на тестовых данных
-        plt.subplot(1, 3, 3)
-        for name, data in results[hidden_size].items():
-            plt.plot(data['test_accuracy'], label=f"{name}")
-        plt.xlabel('Epoch')
-        plt.ylabel('Test Accuracy')
-        plt.title(f'Test Accuracy (Hidden Size: {hidden_size})')
-        plt.legend()
-
-        plt.tight_layout()
-        plt.show()
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":
